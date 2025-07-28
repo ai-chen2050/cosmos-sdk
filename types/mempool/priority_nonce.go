@@ -201,6 +201,90 @@ func (mp *PriorityNonceMempool[C]) NextSenderTx(sender string) sdk.Tx {
 //
 // Inserting a duplicate tx with a different priority overwrites the existing tx,
 // changing the total order of the mempool.
+func (mp *PriorityNonceMempool[C]) InsertWithGasWanted(ctx context.Context, tx sdk.Tx, gasWanted uint64) error {
+	mp.mtx.Lock()
+	defer mp.mtx.Unlock()
+	if mp.cfg.MaxTx > 0 && mp.priorityIndex.Len() >= mp.cfg.MaxTx {
+		return ErrMempoolTxMaxCapacity
+	} else if mp.cfg.MaxTx < 0 {
+		return nil
+	}
+
+	memTx := NewMempoolTx(tx, gasWanted)
+
+	sigs, err := mp.cfg.SignerExtractor.GetSigners(tx)
+	if err != nil {
+		return err
+	}
+	if len(sigs) == 0 {
+		return fmt.Errorf("tx must have at least one signer")
+	}
+
+	sig := sigs[0]
+	sender := sig.Signer.String()
+	priority := mp.cfg.TxPriority.GetTxPriority(ctx, tx)
+	nonce := sig.Sequence
+	key := txMeta[C]{nonce: nonce, priority: priority, sender: sender}
+
+	senderIndex, ok := mp.senderIndices[sender]
+	if !ok {
+		senderIndex = skiplist.New(skiplist.LessThanFunc(func(a, b any) int {
+			return skiplist.Uint64.Compare(b.(txMeta[C]).nonce, a.(txMeta[C]).nonce)
+		}))
+
+		// initialize sender index if not found
+		mp.senderIndices[sender] = senderIndex
+	}
+
+	// Since mp.priorityIndex is scored by priority, then sender, then nonce, a
+	// changed priority will create a new key, so we must remove the old key and
+	// re-insert it to avoid having the same tx with different priorityIndex indexed
+	// twice in the mempool.
+	//
+	// This O(log n) remove operation is rare and only happens when a tx's priority
+	// changes.
+	sk := txMeta[C]{nonce: nonce, sender: sender}
+	if oldScore, txExists := mp.scores[sk]; txExists {
+		if mp.cfg.TxReplacement != nil && !mp.cfg.TxReplacement(oldScore.priority, priority, senderIndex.Get(key).Value.(Tx).Tx, tx) {
+			return fmt.Errorf(
+				"tx doesn't fit the replacement rule, oldPriority: %v, newPriority: %v, oldTx: %v, newTx: %v",
+				oldScore.priority,
+				priority,
+				senderIndex.Get(key).Value.(Tx).Tx,
+				tx,
+			)
+		}
+
+		mp.priorityIndex.Remove(txMeta[C]{
+			nonce:    nonce,
+			sender:   sender,
+			priority: oldScore.priority,
+			weight:   oldScore.weight,
+		})
+		mp.priorityCounts[oldScore.priority]--
+	}
+
+	mp.priorityCounts[priority]++
+
+	// Since senderIndex is scored by nonce, a changed priority will overwrite the
+	// existing key.
+	key.senderElement = senderIndex.Set(key, memTx)
+
+	mp.scores[sk] = txMeta[C]{priority: priority}
+	mp.priorityIndex.Set(key, tx)
+
+	return nil
+}
+
+// Insert attempts to insert a Tx into the app-side mempool in O(log n) time,
+// returning an error if unsuccessful. Sender and nonce are derived from the
+// transaction's first signature.
+//
+// Transactions are unique by sender and nonce. Inserting a duplicate tx is an
+// O(log n) no-op.
+//
+// Inserting a duplicate tx with a different priority overwrites the existing tx,
+// changing the total order of the mempool.
 func (mp *PriorityNonceMempool[C]) Insert(ctx context.Context, tx sdk.Tx) error {
 	mp.mtx.Lock()
 	defer mp.mtx.Unlock()

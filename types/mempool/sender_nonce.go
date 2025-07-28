@@ -117,6 +117,46 @@ func (snm *SenderNonceMempool) NextSenderTx(sender string) sdk.Tx {
 
 // Insert adds a tx to the mempool. It returns an error if the tx does not have
 // at least one signer. Note, priority is ignored.
+func (snm *SenderNonceMempool) InsertWithGasWanted(_ context.Context, tx sdk.Tx, gasLimit uint64) error {
+	snm.mtx.Lock()
+	defer snm.mtx.Unlock()
+	if snm.maxTx > 0 && len(snm.existingTx) >= snm.maxTx {
+		return ErrMempoolTxMaxCapacity
+	}
+	if snm.maxTx < 0 {
+		return nil
+	}
+
+	memTx := NewMempoolTx(tx, gasLimit)
+
+	sigs, err := tx.(signing.SigVerifiableTx).GetSignaturesV2()
+	if err != nil {
+		return err
+	}
+	if len(sigs) == 0 {
+		return fmt.Errorf("tx must have at least one signer")
+	}
+
+	sig := sigs[0]
+	sender := sdk.AccAddress(sig.PubKey.Address()).String()
+	nonce := sig.Sequence
+
+	senderTxs, found := snm.senders[sender]
+	if !found {
+		senderTxs = skiplist.New(skiplist.Uint64)
+		snm.senders[sender] = senderTxs
+	}
+
+	senderTxs.Set(nonce, memTx)
+
+	key := txKey{nonce: nonce, address: sender}
+	snm.existingTx[key] = true
+
+	return nil
+}
+
+// Insert adds a tx to the mempool. It returns an error if the tx does not have
+// at least one signer. Note, priority is ignored.
 func (snm *SenderNonceMempool) Insert(_ context.Context, tx sdk.Tx) error {
 	snm.mtx.Lock()
 	defer snm.mtx.Unlock()
