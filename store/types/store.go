@@ -154,11 +154,24 @@ type MultiStore interface {
 	LatestVersion() int64
 }
 
+type RootMultiStore interface {
+	MultiStore
+
+	// CacheMultiStoreWithVersion branches the underlying MultiStore where
+	// each stored is loaded at a specific version (height).
+	CacheMultiStoreWithVersion(version int64) (CacheMultiStore, error)
+
+	// LatestVersion returns the latest version in the store
+	LatestVersion() int64
+}
+
 // From MultiStore.CacheMultiStore()....
 type CacheMultiStore interface {
 	MultiStore
 	Write()                // Writes operations to underlying KVStore
 	Copy() CacheMultiStore // Returns a deep copy of the CacheMultiStore
+
+	RunAtomic(func(CacheMultiStore) error) error
 }
 
 // CommitMultiStore is an interface for a MultiStore without cache capabilities.
@@ -334,6 +347,7 @@ const (
 	StoreTypeMemory
 	StoreTypeSMT
 	StoreTypePersistent
+	StoreTypeObject
 )
 
 func (st StoreType) String() string {
@@ -435,6 +449,29 @@ func (key *TransientStoreKey) Name() string {
 // Implements StoreKey
 func (key *TransientStoreKey) String() string {
 	return fmt.Sprintf("TransientStoreKey{%p, %s}", key, key.name)
+}
+
+// ObjectStoreKey is used for indexing transient stores in a MultiStore
+type ObjectStoreKey struct {
+	name string
+}
+
+// Constructs new ObjectStoreKey
+// Must return a pointer according to the ocap principle
+func NewObjectStoreKey(name string) *ObjectStoreKey {
+	return &ObjectStoreKey{
+		name: name,
+	}
+}
+
+// Implements StoreKey
+func (key *ObjectStoreKey) Name() string {
+	return key.name
+}
+
+// Implements StoreKey
+func (key *ObjectStoreKey) String() string {
+	return fmt.Sprintf("ObjectStoreKey{%p, %s}", key, key.name)
 }
 
 // MemoryStoreKey defines a typed key to be used with an in-memory KVStore.

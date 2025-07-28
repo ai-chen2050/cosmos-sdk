@@ -757,7 +757,6 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 	if err != nil {
 		return nil, err
 	}
-
 	events = append(events, preblockEvents...)
 
 	beginBlock, err := app.beginBlock(req)
@@ -778,46 +777,46 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 
 	// Reset the gas meter so that the AnteHandlers aren't required to
 	gasMeter = app.getBlockGasMeter(app.finalizeBlockState.Context())
-	app.finalizeBlockState.SetContext(app.finalizeBlockState.Context().WithBlockGasMeter(gasMeter))
+	app.finalizeBlockState.SetContext(
+		app.finalizeBlockState.Context().
+			WithBlockGasMeter(gasMeter).
+			WithTxCount(len(req.Txs)),
+	)
 
 	// Iterate over all raw transactions in the proposal and attempt to execute
 	// them, gathering the execution results.
 	//
 	// NOTE: Not all raw transactions may adhere to the sdk.Tx interface, e.g.
 	// vote extensions, so skip those.
-	txResults := make([]*abci.ExecTxResult, 0, len(req.Txs))
-	for _, rawTx := range req.Txs {
-		var response *abci.ExecTxResult
-
-		if _, err := app.txDecoder(rawTx); err == nil {
-			response = app.deliverTx(rawTx)
-		} else {
-			// In the case where a transaction included in a block proposal is malformed,
-			// we still want to return a default response to comet. This is because comet
-			// expects a response for each transaction included in a block proposal.
-			response = sdkerrors.ResponseExecTxResultWithEvents(
-				sdkerrors.ErrTxDecode,
-				0,
-				0,
-				nil,
-				false,
-			)
-		}
-
-		// check after every tx if we should abort
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-			// continue
-		}
-
-		txResults = append(txResults, response)
+	txResults, err := app.executeTxs(ctx, req.Txs)
+	if err != nil {
+		// usually due to canceled
+		return nil, err
 	}
 
 	if app.finalizeBlockState.ms.TracingEnabled() {
 		app.finalizeBlockState.ms = app.finalizeBlockState.ms.SetTracingContext(nil).(storetypes.CacheMultiStore)
 	}
+
+	var (
+		blockGasUsed   uint64
+		blockGasWanted uint64
+	)
+	for _, res := range txResults {
+		// GasUsed should not be -1 but just in case
+		if res.GasUsed > 0 {
+			blockGasUsed += uint64(res.GasUsed)
+		}
+		// GasWanted could be -1 if the tx is invalid
+		if res.GasWanted > 0 {
+			blockGasWanted += uint64(res.GasWanted)
+		}
+	}
+	app.finalizeBlockState.SetContext(
+		app.finalizeBlockState.Context().
+			WithBlockGasUsed(blockGasUsed).
+			WithBlockGasWanted(blockGasWanted),
+	)
 
 	endBlock, err := app.endBlock(app.finalizeBlockState.Context())
 	if err != nil {
@@ -841,6 +840,45 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 		ValidatorUpdates:      endBlock.ValidatorUpdates,
 		ConsensusParamUpdates: &cp,
 	}, nil
+}
+
+func (app *BaseApp) executeTxs(ctx context.Context, txs [][]byte) ([]*abci.ExecTxResult, error) {
+	if app.txExecutor != nil {
+		return app.txExecutor(ctx, txs, app.finalizeBlockState.ms, func(i int, memTx sdk.Tx, ms storetypes.MultiStore, incarnationCache map[string]any) *abci.ExecTxResult {
+			return app.deliverTxWithMultiStore(txs[i], memTx, i, ms, incarnationCache)
+		})
+	}
+
+	txResults := make([]*abci.ExecTxResult, 0, len(txs))
+	for i, rawTx := range txs {
+		var response *abci.ExecTxResult
+
+		if memTx, err := app.txDecoder(rawTx); err == nil {
+			response = app.deliverTx(rawTx, memTx, i)
+		} else {
+			// In the case where a transaction included in a block proposal is malformed,
+			// we still want to return a default response to comet. This is because comet
+			// expects a response for each transaction included in a block proposal.
+			response = sdkerrors.ResponseExecTxResultWithEvents(
+				sdkerrors.ErrTxDecode,
+				0,
+				0,
+				nil,
+				false,
+			)
+		}
+
+		// check after every tx if we should abort
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			// continue
+		}
+
+		txResults = append(txResults, response)
+	}
+	return txResults, nil
 }
 
 // FinalizeBlock will execute the block proposal provided by RequestFinalizeBlock.
@@ -896,10 +934,10 @@ func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.Res
 func (app *BaseApp) checkHalt(height int64, time time.Time) error {
 	var halt bool
 	switch {
-	case app.haltHeight > 0 && uint64(height) > app.haltHeight:
+	case app.haltHeight > 0 && uint64(height) >= app.haltHeight:
 		halt = true
 
-	case app.haltTime > 0 && time.Unix() > int64(app.haltTime):
+	case app.haltTime > 0 && time.Unix() >= int64(app.haltTime):
 		halt = true
 	}
 
@@ -1191,7 +1229,7 @@ func (app *BaseApp) CreateQueryContext(height int64, prove bool) (sdk.Context, e
 	// use custom query multi-store if provided
 	qms := app.qms
 	if qms == nil {
-		qms = app.cms.(storetypes.MultiStore)
+		qms = storetypes.RootMultiStore(app.cms)
 	}
 
 	lastBlockHeight := qms.LatestVersion()
